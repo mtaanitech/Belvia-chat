@@ -1,8 +1,10 @@
+
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
 const { testDatabaseConnection } = require("./db");
+const authRoutes = require("./auth");
 
 const app = express();
 
@@ -32,11 +34,12 @@ app.get("/api/health/database", async (req, res) => {
 
     res.status(503).json({
       success: false,
-      database: "disconnected",
-      message: "Database connection failed"
+      database: "disconnected"
     });
   }
 });
+
+app.use("/api/auth", authRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
