@@ -1,4 +1,3 @@
-
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -9,9 +8,11 @@ const router = express.Router();
 
 const CODE_LIFETIME_MINUTES = 3;
 const MAX_CODE_ATTEMPTS = 5;
+const PASSWORD_MIN_LENGTH = 10;
+const PASSWORD_MAX_LENGTH = 72;
 
 // --------------------
-// BASIC HELPERS
+// HELPERS
 // --------------------
 
 function normalizePhone(phone) {
@@ -20,6 +21,11 @@ function normalizePhone(phone) {
 
 function validPhone(phone) {
   return /^\+[1-9]\d{7,14}$/.test(phone);
+}
+
+function cleanDeviceName(name) {
+  if (typeof name !== "string") return "Unknown device";
+  return name.trim().slice(0, 100) || "Unknown device";
 }
 
 function validDeviceName(name) {
@@ -41,10 +47,23 @@ function createVerificationCode() {
 }
 
 function hashCode(code) {
-  return crypto
-    .createHash("sha256")
-    .update(String(code))
-    .digest("hex");
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+function safeHashCompare(first, second) {
+  if (
+    typeof first !== "string" ||
+    typeof second !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(first) ||
+    !/^[a-f0-9]{64}$/i.test(second)
+  ) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(
+    Buffer.from(first, "hex"),
+    Buffer.from(second, "hex")
+  );
 }
 
 function checkJwtSecret() {
@@ -52,9 +71,7 @@ function checkJwtSecret() {
     !process.env.JWT_SECRET ||
     process.env.JWT_SECRET.length < 32
   ) {
-    throw new Error(
-      "JWT_SECRET must contain at least 32 characters"
-    );
+    throw new Error("JWT_SECRET must contain at least 32 characters");
   }
 }
 
@@ -64,17 +81,34 @@ function createAccessToken(userId, deviceId) {
   return jwt.sign(
     { userId, deviceId },
     process.env.JWT_SECRET,
-    { expiresIn: "15m" }
+    {
+      algorithm: "HS256",
+      expiresIn: "15m"
+    }
   );
 }
 
+function publicUser(user) {
+  return {
+    id: user.id,
+    phone_number: user.phone_number,
+    username: user.username,
+    display_name: user.display_name,
+    avatar_url: user.avatar_url,
+    about: user.about,
+    auth_method: user.auth_method,
+    created_at: user.created_at
+  };
+}
+
+// --------------------
+// AUTHENTICATION
+// --------------------
+
 function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ")
-    ? header.slice(7)
-    : "";
 
-  if (!token) {
+  if (!header.startsWith("Bearer ")) {
     return res.status(401).json({
       success: false,
       message: "Authentication required"
@@ -84,14 +118,18 @@ function authenticate(req, res, next) {
   try {
     checkJwtSecret();
 
-    req.auth = jwt.verify(token, process.env.JWT_SECRET);
+    const token = header.slice(7);
+
+    req.auth = jwt.verify(token, process.env.JWT_SECRET, {
+      algorithms: ["HS256"]
+    });
 
     if (!req.auth.userId || !req.auth.deviceId) {
-      throw new Error("Invalid token");
+      throw new Error("Invalid access token");
     }
 
     next();
-  } catch (error) {
+  } catch (_) {
     return res.status(401).json({
       success: false,
       message: "Invalid or expired access token"
@@ -122,12 +160,10 @@ router.post("/register", async (req, res) => {
   try {
     checkJwtSecret();
 
-    const phone = normalizePhone(req.body.phone_number);
-    const authMethod = req.body.auth_method;
-    const password = req.body.password;
-    const deviceName = String(
-      req.body.device_name || "Unknown device"
-    ).trim().slice(0, 100);
+    const phone = normalizePhone(req.body?.phone_number);
+    const authMethod = req.body?.auth_method;
+    const password = req.body?.password;
+    const deviceName = cleanDeviceName(req.body?.device_name);
 
     if (!validPhone(phone)) {
       return res.status(400).json({
@@ -145,9 +181,11 @@ router.post("/register", async (req, res) => {
 
     if (
       authMethod === "phone_password" &&
-      (typeof password !== "string" ||
-        password.length < 10 ||
-        password.length > 72)
+      (
+        typeof password !== "string" ||
+        password.length < PASSWORD_MIN_LENGTH ||
+        password.length > PASSWORD_MAX_LENGTH
+      )
     ) {
       return res.status(400).json({
         success: false,
@@ -173,7 +211,6 @@ router.post("/register", async (req, res) => {
     const deviceToken = createDeviceToken();
 
     client = await getPool().connect();
-
     await client.query("BEGIN");
 
     const userResult = await client.query(
@@ -181,7 +218,8 @@ router.post("/register", async (req, res) => {
        (phone_number, password_hash, auth_method)
        VALUES ($1, $2, $3)
        RETURNING id, phone_number, username,
-                 display_name, auth_method, created_at`,
+                 display_name, avatar_url, about,
+                 auth_method, created_at`,
       [phone, passwordHash, authMethod]
     );
 
@@ -196,8 +234,6 @@ router.post("/register", async (req, res) => {
     );
 
     const device = deviceResult.rows[0];
-
-    // Create token BEFORE committing the account.
     const accessToken = createAccessToken(user.id, device.id);
 
     await client.query("COMMIT");
@@ -205,7 +241,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "BELVIA account created successfully",
-      user,
+      user: publicUser(user),
       device,
       accessToken,
       deviceToken
@@ -222,6 +258,13 @@ router.post("/register", async (req, res) => {
       return res.status(409).json({
         success: false,
         message: "This phone number or username already exists"
+      });
+    }
+
+    if (error.code === "23514") {
+      return res.status(400).json({
+        success: false,
+        message: "Account authentication details are invalid"
       });
     }
 
@@ -245,14 +288,16 @@ router.post("/login", async (req, res) => {
   try {
     checkJwtSecret();
 
-    const phone = normalizePhone(req.body.phone_number);
-    const password = req.body.password;
-    const deviceToken = req.body.device_token;
-    const deviceName = String(
-      req.body.device_name || "Unknown device"
-    ).trim().slice(0, 100);
+    const phone = normalizePhone(req.body?.phone_number);
+    const password = req.body?.password;
+    const suppliedDeviceToken = req.body?.device_token;
+    const deviceName = cleanDeviceName(req.body?.device_name);
 
-    if (!validPhone(phone) || typeof password !== "string") {
+    if (
+      !validPhone(phone) ||
+      typeof password !== "string" ||
+      password.length > PASSWORD_MAX_LENGTH
+    ) {
       return res.status(400).json({
         success: false,
         message: "Invalid login details"
@@ -260,8 +305,9 @@ router.post("/login", async (req, res) => {
     }
 
     const result = await getPool().query(
-      `SELECT id, phone_number, password_hash,
-              auth_method, username, display_name
+      `SELECT id, phone_number, username, display_name,
+              avatar_url, about, password_hash, auth_method,
+              created_at
        FROM users
        WHERE phone_number = $1`,
       [phone]
@@ -298,37 +344,36 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // Existing trusted device.
-    if (deviceToken) {
-      const deviceResult = await getPool().query(
-        `SELECT id, device_name
-         FROM devices
+    // Check whether this is an already trusted device.
+    if (
+      typeof suppliedDeviceToken === "string" &&
+      /^[a-f0-9]{64}$/i.test(suppliedDeviceToken)
+    ) {
+      const existingDevice = await getPool().query(
+        `UPDATE devices
+         SET last_seen = NOW()
          WHERE user_id = $1
            AND device_token_hash = $2
-           AND is_active = TRUE`,
-        [user.id, hashToken(deviceToken)]
+           AND is_active = TRUE
+         RETURNING id, device_name`,
+        [user.id, hashToken(suppliedDeviceToken)]
       );
 
-      if (deviceResult.rowCount) {
-        const device = deviceResult.rows[0];
-
-        await getPool().query(
-          "UPDATE devices SET last_seen = NOW() WHERE id = $1",
-          [device.id]
-        );
+      if (existingDevice.rowCount) {
+        const device = existingDevice.rows[0];
 
         return res.json({
           success: true,
           message: "Login successful",
-          user,
+          user: publicUser(user),
           device,
           accessToken: createAccessToken(user.id, device.id)
         });
       }
     }
 
-    // New device: password authentication is sufficient.
-    // The phone number and password remain the chosen method.
+    // A new device is allowed after the chosen
+    // phone + password method succeeds.
     const newDeviceToken = createDeviceToken();
 
     const newDevice = await getPool().query(
@@ -341,10 +386,10 @@ router.post("/login", async (req, res) => {
 
     const device = newDevice.rows[0];
 
-    return res.status(200).json({
+    return res.json({
       success: true,
       message: "Login successful on new device",
-      user,
+      user: publicUser(user),
       device,
       accessToken: createAccessToken(user.id, device.id),
       deviceToken: newDeviceToken,
@@ -362,20 +407,119 @@ router.post("/login", async (req, res) => {
 });
 
 // --------------------
+// REFRESH ACCESS TOKEN
+// --------------------
+
+router.post("/refresh", async (req, res) => {
+  try {
+    checkJwtSecret();
+
+    const deviceToken = req.body?.device_token;
+
+    if (
+      typeof deviceToken !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(deviceToken)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid device token required"
+      });
+    }
+
+    const result = await getPool().query(
+      `UPDATE devices
+       SET last_seen = NOW()
+       WHERE device_token_hash = $1
+         AND is_active = TRUE
+       RETURNING id, user_id, device_name`,
+      [hashToken(deviceToken)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(401).json({
+        success: false,
+        message: "Device is not trusted"
+      });
+    }
+
+    const device = result.rows[0];
+
+    return res.json({
+      success: true,
+      device: {
+        id: device.id,
+        device_name: device.device_name
+      },
+      accessToken: createAccessToken(device.user_id, device.id)
+    });
+
+  } catch (error) {
+    console.error("Token refresh error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not refresh access token"
+    });
+  }
+});
+
+// --------------------
+// CURRENT USER
+// --------------------
+
+router.get("/me", authenticate, async (req, res) => {
+  try {
+    const device = await getAuthenticatedDevice(req);
+
+    if (!device) {
+      return res.status(401).json({
+        success: false,
+        message: "Trusted device not found"
+      });
+    }
+
+    const result = await getPool().query(
+      `SELECT id, phone_number, username, display_name,
+              avatar_url, about, auth_method, created_at
+       FROM users
+       WHERE id = $1`,
+      [req.auth.userId]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Account not found"
+      });
+    }
+
+    return res.json({
+      success: true,
+      user: result.rows[0],
+      device
+    });
+
+  } catch (error) {
+    console.error("Current user error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not load account"
+    });
+  }
+});
+
+// --------------------
 // REQUEST DEVICE LINK
-// New phone requests permission.
 // --------------------
 
 router.post("/device-link/request", async (req, res) => {
   let client;
 
   try {
-    const phone = normalizePhone(req.body.phone_number);
-    const deviceName = String(
-      req.body.device_name || ""
-    ).trim();
-
-    const deviceToken = req.body.device_token;
+    const phone = normalizePhone(req.body?.phone_number);
+    const deviceName = req.body?.device_name;
+    const deviceToken = req.body?.device_token;
 
     if (
       !validPhone(phone) ||
@@ -389,8 +533,9 @@ router.post("/device-link/request", async (req, res) => {
       });
     }
 
-    client = await getPool().connect();
+    const targetTokenHash = hashToken(deviceToken);
 
+    client = await getPool().connect();
     await client.query("BEGIN");
 
     const userResult = await client.query(
@@ -415,6 +560,23 @@ router.post("/device-link/request", async (req, res) => {
 
     const user = userResult.rows[0];
 
+    // Do not reuse a device token that already belongs to a device.
+    const existingDevice = await client.query(
+      `SELECT id
+       FROM devices
+       WHERE device_token_hash = $1`,
+      [targetTokenHash]
+    );
+
+    if (existingDevice.rowCount) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).json({
+        success: false,
+        message: "This device is already linked"
+      });
+    }
+
     const sourceResult = await client.query(
       `SELECT id
        FROM devices
@@ -434,16 +596,27 @@ router.post("/device-link/request", async (req, res) => {
       });
     }
 
-    // A new request invalidates previous unused requests.
+    // Invalidate previous pending requests and release old
+    // target hashes so the same new device can retry later.
     await client.query(
       `UPDATE device_link_codes
-       SET consumed_at = NOW()
+       SET consumed_at = COALESCE(consumed_at, NOW()),
+           target_device_token_hash = NULL
        WHERE user_id = $1
          AND consumed_at IS NULL`,
       [user.id]
     );
 
-    const placeholder = hashToken(createDeviceToken());
+    // A completed request may still hold this target hash.
+    // Clear it because its device token is now being reused.
+    await client.query(
+      `UPDATE device_link_codes
+       SET target_device_token_hash = NULL
+       WHERE target_device_token_hash = $1`,
+      [targetTokenHash]
+    );
+
+    const placeholderHash = hashToken(createDeviceToken());
 
     const requestResult = await client.query(
       `INSERT INTO device_link_codes
@@ -457,9 +630,9 @@ router.post("/device-link/request", async (req, res) => {
       [
         user.id,
         sourceResult.rows[0].id,
-        placeholder,
-        deviceName,
-        hashToken(deviceToken)
+        placeholderHash,
+        deviceName.trim(),
+        targetTokenHash
       ]
     );
 
@@ -537,7 +710,6 @@ router.get(
 
 // --------------------
 // OLD DEVICE: APPROVE REQUEST
-// Old phone displays the generated code.
 // --------------------
 
 router.post(
@@ -545,8 +717,6 @@ router.post(
   authenticate,
   async (req, res) => {
     try {
-      checkJwtSecret();
-
       const device = await getAuthenticatedDevice(req);
 
       if (!device) {
@@ -612,11 +782,12 @@ router.post("/device-link/verify", async (req, res) => {
   try {
     checkJwtSecret();
 
-    const requestId = req.body.request_id;
-    const code = String(req.body.code || "");
+    const requestId = req.body?.request_id;
+    const code = String(req.body?.code || "");
 
     if (
       typeof requestId !== "string" ||
+      !/^[0-9a-f-]{36}$/i.test(requestId) ||
       !/^\d{6}$/.test(code)
     ) {
       return res.status(400).json({
@@ -626,17 +797,23 @@ router.post("/device-link/verify", async (req, res) => {
     }
 
     client = await getPool().connect();
-
     await client.query("BEGIN");
 
     const result = await client.query(
-      `SELECT id, user_id, source_device_id,
-              code_hash, target_device_name,
-              target_device_token_hash,
-              expires_at, consumed_at, attempts
-       FROM device_link_codes
-       WHERE id = $1
-       FOR UPDATE`,
+      `SELECT dlc.id, dlc.user_id, dlc.source_device_id,
+              dlc.code_hash, dlc.target_device_name,
+              dlc.target_device_token_hash,
+              dlc.expires_at, dlc.consumed_at, dlc.attempts,
+              u.auth_method,
+              d.id AS active_source_device_id
+       FROM device_link_codes dlc
+       JOIN users u ON u.id = dlc.user_id
+       LEFT JOIN devices d
+         ON d.id = dlc.source_device_id
+        AND d.user_id = dlc.user_id
+        AND d.is_active = TRUE
+       WHERE dlc.id = $1
+       FOR UPDATE OF dlc`,
       [requestId]
     );
 
@@ -652,13 +829,17 @@ router.post("/device-link/verify", async (req, res) => {
     const request = result.rows[0];
 
     if (
+      request.auth_method !== "device_verification" ||
+      !request.active_source_device_id ||
+      !request.target_device_name ||
+      !request.target_device_token_hash ||
       request.consumed_at ||
       new Date(request.expires_at).getTime() <= Date.now() ||
       request.attempts >= MAX_CODE_ATTEMPTS
     ) {
       await client.query(
         `UPDATE device_link_codes
-         SET consumed_at = NOW()
+         SET consumed_at = COALESCE(consumed_at, NOW())
          WHERE id = $1`,
         [requestId]
       );
@@ -667,11 +848,11 @@ router.post("/device-link/verify", async (req, res) => {
 
       return res.status(410).json({
         success: false,
-        message: "Verification code expired. Request a new one."
+        message: "Verification request expired or is no longer available"
       });
     }
 
-    if (hashCode(code) !== request.code_hash) {
+    if (!safeHashCompare(hashCode(code), request.code_hash)) {
       const attempts = request.attempts + 1;
 
       await client.query(
@@ -737,6 +918,13 @@ router.post("/device-link/verify", async (req, res) => {
       try {
         await client.query("ROLLBACK");
       } catch (_) {}
+    }
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message: "This device token is already linked"
+      });
     }
 
     console.error("Device verification error:", error.message);
