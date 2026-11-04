@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const { testDatabaseConnection } = require("./db");
@@ -40,11 +41,21 @@ app.get("/api/health/database", async (req, res) => {
 
 app.use("/api/auth", authRoutes);
 
-app.use((req, res) => {
+// Unknown API routes return JSON 404
+app.use("/api", (req, res) => {
   res.status(404).json({
     success: false,
     message: "API endpoint not found"
   });
+});
+
+// Serve the built frontend (Vite output)
+const distPath = path.join(__dirname, "../dist");
+app.use(express.static(distPath));
+
+// Any other route returns the React app
+app.get("/{*splat}", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
 });
 
 app.use((err, req, res, next) => {
