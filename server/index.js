@@ -1,16 +1,24 @@
+
 require("dotenv").config();
 
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
+
 const { testDatabaseConnection } = require("./db");
 const authRoutes = require("./auth");
+const chatRoutes = require("./chat");
 
 const app = express();
 
 app.disable("x-powered-by");
+
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+
+// --------------------
+// HEALTH CHECK
+// --------------------
 
 app.get("/health", (req, res) => {
   res.json({
@@ -39,7 +47,12 @@ app.get("/api/health/database", async (req, res) => {
   }
 });
 
+// --------------------
+// API ROUTES
+// --------------------
+
 app.use("/api/auth", authRoutes);
+app.use("/api/chat", chatRoutes);
 
 // Unknown API routes return JSON 404
 app.use("/api", (req, res) => {
@@ -49,14 +62,21 @@ app.use("/api", (req, res) => {
   });
 });
 
-// Serve the built frontend (Vite output)
+// --------------------
+// FRONTEND
+// --------------------
+
 const distPath = path.join(__dirname, "../dist");
+
 app.use(express.static(distPath));
 
-// Any other route returns the React app
 app.get("/{*splat}", (req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
 });
+
+// --------------------
+// ERROR HANDLER
+// --------------------
 
 app.use((err, req, res, next) => {
   console.error("Server error:", err.message);
@@ -66,6 +86,10 @@ app.use((err, req, res, next) => {
     message: "Internal server error"
   });
 });
+
+// --------------------
+// START SERVER
+// --------------------
 
 const PORT = process.env.PORT || 5000;
 
