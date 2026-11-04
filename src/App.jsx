@@ -1,11 +1,12 @@
-
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   MessageCircle, CircleDot, Phone, Settings, Search,
   ArrowLeft, Send, Plus, MoreVertical, Lock,
-  CheckCheck, X, UserPlus, LogOut, Trash2,
-  User, Shield, Bell, RefreshCw
+  CheckCheck, X, UserPlus, LogOut,
+  User, Shield, Bell
 } from "lucide-react";
+
+import "./App.css";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -24,25 +25,32 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data.message || "Request failed");
+    throw new Error(data.message || `Request failed (${response.status})`);
   }
 
   return data;
 }
 
-const timeNow = () =>
-  new Date().toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit"
-  });
-
-function Avatar({ name = "U", online }) {
+function Avatar({ name = "U", online = false }) {
   return (
     <div className="avatar">
-      {name.charAt(0).toUpperCase()}
+      {String(name).charAt(0).toUpperCase()}
       {online && <span className="avatar-online" />}
     </div>
   );
+}
+
+function formatTime(value) {
+  if (!value) return "";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return "";
+
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 function App() {
@@ -50,69 +58,135 @@ function App() {
   const [chats, setChats] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [currentUser, setCurrentUser] = useState(null);
+
   const [text, setText] = useState("");
   const [search, setSearch] = useState("");
-  const [newChatOpen, setNewChatOpen] = useState(false);
   const [phone, setPhone] = useState("");
+
+  const [newChatOpen, setNewChatOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+
+  const [chatsLoading, setChatsLoading] = useState(false);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
   const endRef = useRef(null);
 
   const activeChat = chats.find(
     chat => String(chat.id) === String(activeId)
   );
 
-  const loadChats = useCallback(async () => {
+  // Load the logged-in user.
+  const loadCurrentUser = useCallback(async () => {
     try {
-      setLoading(true);
-      setError("");
-
-      const data = await api("/api/chats");
-
-      setChats(data.chats || []);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
+      const data = await api("/api/auth/me");
+      setCurrentUser(data.user || data);
+    } catch {
+      // Do not block the chat screen if this endpoint
+      // returns a different response format.
     }
   }, []);
 
-  const loadMessages = useCallback(async (chatId) => {
+  // Load conversations from the server.
+  const loadChats = useCallback(async (silent = false) => {
     try {
+      if (!silent) setChatsLoading(true);
+
+      const data = await api("/api/chats");
+      setChats(Array.isArray(data.chats) ? data.chats : []);
+
+      if (!silent) setError("");
+    } catch (err) {
+      if (!silent) setError(err.message);
+    } finally {
+      if (!silent) setChatsLoading(false);
+    }
+  }, []);
+
+  // Load messages for one conversation.
+  const loadMessages = useCallback(async (chatId, silent = false) => {
+    if (!chatId) return;
+
+    try {
+      if (!silent) setMessagesLoading(true);
+
       const data = await api(
         `/api/chats/${encodeURIComponent(chatId)}/messages`
       );
 
-      setMessages(data.messages || []);
+      setMessages(
+        Array.isArray(data.messages) ? data.messages : []
+      );
+
+      if (!silent) setError("");
     } catch (err) {
-      setError(err.message);
+      if (!silent) setError(err.message);
+    } finally {
+      if (!silent) setMessagesLoading(false);
     }
   }, []);
 
+  // Initial loading.
   useEffect(() => {
+    loadCurrentUser();
     loadChats();
+  }, [loadCurrentUser, loadChats]);
+
+  // Refresh conversations periodically for incoming chats.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadChats(true);
+    }, 10000);
+
+    return () => clearInterval(interval);
   }, [loadChats]);
 
+  // Load and refresh messages while a conversation is open.
   useEffect(() => {
-    if (activeId !== null) {
-      loadMessages(activeId);
-    }
+    if (activeId === null) return;
+
+    loadMessages(activeId);
+
+    const interval = setInterval(() => {
+      loadMessages(activeId, true);
+    }, 5000);
+
+    return () => clearInterval(interval);
   }, [activeId, loadMessages]);
 
+  // Scroll to the latest message.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    endRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "end"
+    });
   }, [messages]);
 
+  // Determine whether a message belongs to the logged-in user.
+  const isMine = message => {
+    const senderId = message.sender_id || message.user_id;
+    const myId = currentUser?.id || currentUser?.user?.id;
+
+    if (senderId && myId) {
+      return String(senderId) === String(myId);
+    }
+
+    return message.from === "me";
+  };
+
+  // Send a real message through the backend.
   const sendMessage = async () => {
     const value = text.trim();
 
-    if (!value || !activeId || loading) return;
+    if (!value || !activeId || sending) return;
 
     try {
-      setLoading(true);
+      setSending(true);
       setError("");
 
       const data = await api(
@@ -126,52 +200,67 @@ function App() {
         }
       );
 
+      setText("");
+
       if (data.message) {
-        setMessages(prev => [...prev, data.message]);
+        setMessages(previous => {
+          const exists = previous.some(
+            item => item.id && item.id === data.message.id
+          );
+
+          return exists
+            ? previous
+            : [...previous, data.message];
+        });
       } else {
-        await loadMessages(activeId);
+        await loadMessages(activeId, true);
       }
 
-      setText("");
-      await loadChats();
+      await loadChats(true);
     } catch (err) {
       setError(err.message);
     } finally {
-      setLoading(false);
+      setSending(false);
     }
   };
 
+  // Start a conversation using an international phone number.
   const createChat = async () => {
     const number = phone.trim();
 
-    if (!number.startsWith("+")) {
-      setError("Enter an international phone number.");
+    if (!/^\+[1-9]\d{7,14}$/.test(number)) {
+      setError("Enter a valid international phone number.");
       return;
     }
 
     try {
-      setLoading(true);
       setError("");
 
       const data = await api("/api/chats", {
         method: "POST",
-        body: JSON.stringify({ phone_number: number })
+        body: JSON.stringify({
+          phone_number: number
+        })
       });
 
-      await loadChats();
+      const conversation =
+        data.conversation || data.chat;
 
-      if (data.conversation) {
-        setActiveId(data.conversation.id);
-      } else if (data.chat) {
-        setActiveId(data.chat.id);
+      if (!conversation?.id) {
+        throw new Error(
+          "The server did not return a conversation ID."
+        );
       }
 
-      setNewChatOpen(false);
+      await loadChats(true);
+
+      setActiveId(conversation.id);
+      setMessages([]);
       setPhone("");
+      setNewChatOpen(false);
+      setMenuOpen(false);
     } catch (err) {
       setError(err.message);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -181,14 +270,31 @@ function App() {
     window.location.reload();
   };
 
-  const filteredChats = chats.filter(chat => {
-    const name = chat.name || chat.display_name || "";
-    return name.toLowerCase().includes(search.toLowerCase());
-  });
-
   const goBack = () => {
     setActiveId(null);
     setMessages([]);
+    setText("");
+    setMoreOpen(false);
+    setError("");
+    loadChats(true);
+  };
+
+  const filteredChats = chats.filter(chat => {
+    const name =
+      chat.name ||
+      chat.display_name ||
+      chat.phone_number ||
+      "BELVIA user";
+
+    return String(name)
+      .toLowerCase()
+      .includes(search.toLowerCase());
+  });
+
+  const openChat = chat => {
+    setActiveId(chat.id);
+    setMessages([]);
+    setMoreOpen(false);
     setError("");
   };
 
@@ -198,7 +304,10 @@ function App() {
         <h1>Settings</h1>
       </header>
 
-      <button className="chat-row" onClick={() => setNotice("Profile settings")}>
+      <button
+        className="chat-row"
+        onClick={() => setNotice("Profile settings are not connected yet.")}
+      >
         <User size={22} />
         <div className="chat-row-body">
           <strong>Profile</strong>
@@ -206,7 +315,10 @@ function App() {
         </div>
       </button>
 
-      <button className="chat-row" onClick={() => setNotice("Privacy settings")}>
+      <button
+        className="chat-row"
+        onClick={() => setNotice("Privacy settings are not connected yet.")}
+      >
         <Shield size={22} />
         <div className="chat-row-body">
           <strong>Privacy and security</strong>
@@ -214,7 +326,10 @@ function App() {
         </div>
       </button>
 
-      <button className="chat-row" onClick={() => setNotice("Notification settings")}>
+      <button
+        className="chat-row"
+        onClick={() => setNotice("Notification settings are not connected yet.")}
+      >
         <Bell size={22} />
         <div className="chat-row-body">
           <strong>Notifications</strong>
@@ -234,44 +349,89 @@ function App() {
 
   return (
     <div className="app">
-      {activeChat ? (
+      {activeId !== null ? (
         <div className="chat-screen">
           <header className="chat-header">
             <button className="icon-btn" onClick={goBack}>
               <ArrowLeft size={22} />
             </button>
 
-            <Avatar name={activeChat.name || activeChat.display_name || "U"} online={activeChat.online} />
+            <Avatar
+              name={
+                activeChat?.name ||
+                activeChat?.display_name ||
+                "U"
+              }
+              online={activeChat?.online}
+            />
 
             <div className="chat-header-info">
-              <strong>{activeChat.name || activeChat.display_name || "BELVIA user"}</strong>
-              <small>{activeChat.online ? "online" : "BELVIA CHAT"}</small>
+              <strong>
+                {activeChat?.name ||
+                  activeChat?.display_name ||
+                  "BELVIA user"}
+              </strong>
+              <small>
+                {activeChat?.online ? "online" : "BELVIA CHAT"}
+              </small>
             </div>
 
-            <button className="icon-btn" onClick={() => setNotice("Voice calling will be connected to the calling service.")}>
+            <button
+              className="icon-btn"
+              onClick={() =>
+                setNotice("Calling is not connected yet.")
+              }
+              aria-label="Call"
+            >
               <Phone size={19} />
             </button>
 
-            <button className="icon-btn" onClick={() => setMoreOpen(!moreOpen)}>
+            <button
+              className="icon-btn"
+              onClick={() => setMoreOpen(value => !value)}
+              aria-label="Conversation menu"
+            >
               <MoreVertical size={20} />
             </button>
           </header>
 
           {moreOpen && (
-            <div className="list-scroll">
-              <button className="chat-row" onClick={() => setNotice("Conversation details")}>
+            <div className="conversation-menu">
+              <button
+                className="chat-row"
+                onClick={() => {
+                  setMoreOpen(false);
+                  setNotice("Conversation details are not connected yet.");
+                }}
+              >
                 Conversation details
               </button>
-              <button className="chat-row" onClick={() => setNotice("Blocking requires the backend block endpoint.")}>
+
+              <button
+                className="chat-row"
+                onClick={() => {
+                  setMoreOpen(false);
+                  setNotice("Blocking needs a backend endpoint.");
+                }}
+              >
                 Block contact
               </button>
             </div>
           )}
 
           <div className="chat-messages">
+            {messagesLoading && messages.length === 0 && (
+              <p>Loading messages...</p>
+            )}
+
+            {!messagesLoading && messages.length === 0 && (
+              <p className="empty-messages">
+                No messages yet. Say hello!
+              </p>
+            )}
+
             {messages.map((message, index) => {
-              const mine = message.sender_id === message.user_id ||
-                message.from === "me";
+              const mine = isMine(message);
 
               return (
                 <div
@@ -279,34 +439,41 @@ function App() {
                   className={`bubble ${mine ? "me" : "them"}`}
                 >
                   <span className="message-text">
-                    {message.content || message.text}
+                    {message.content || message.text || ""}
                   </span>
+
                   <small>
-                    {message.created_at
-                      ? new Date(message.created_at).toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit"
-                        })
-                      : message.time || ""}
+                    {formatTime(message.created_at) ||
+                      message.time ||
+                      ""}
                     {mine && <CheckCheck size={13} />}
                   </small>
                 </div>
               );
             })}
+
             <div ref={endRef} />
           </div>
 
           <div className="chat-input-bar">
             <input
               value={text}
-              onChange={e => setText(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && sendMessage()}
+              onChange={event => setText(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendMessage();
+                }
+              }}
               placeholder="Message"
+              aria-label="Message"
             />
+
             <button
               className="send-btn"
               onClick={sendMessage}
-              disabled={!text.trim() || loading}
+              disabled={!text.trim() || sending}
+              aria-label="Send message"
             >
               <Send size={19} />
             </button>
@@ -320,32 +487,44 @@ function App() {
                 <header className="list-header">
                   <div className="brand-row">
                     <h1>BELVIA</h1>
+
                     <button
                       className="icon-btn"
-                      onClick={() => setMenuOpen(!menuOpen)}
+                      onClick={() => setMenuOpen(value => !value)}
                     >
                       <MoreVertical size={20} />
                     </button>
                   </div>
 
                   {menuOpen && (
-                    <div>
-                      <button className="chat-row" onClick={() => setTab("settings")}>
-                        <Settings size={18} /> Settings
+                    <div className="header-menu">
+                      <button
+                        className="chat-row"
+                        onClick={() => {
+                          setTab("settings");
+                          setMenuOpen(false);
+                        }}
+                      >
+                        <Settings size={18} />
+                        Settings
                       </button>
+
                       <button className="chat-row" onClick={logout}>
-                        <LogOut size={18} /> Log out
+                        <LogOut size={18} />
+                        Log out
                       </button>
                     </div>
                   )}
 
                   <div className="search">
                     <Search size={16} />
+
                     <input
                       value={search}
-                      onChange={e => setSearch(e.target.value)}
+                      onChange={event => setSearch(event.target.value)}
                       placeholder="Search chats"
                     />
+
                     {search && (
                       <button onClick={() => setSearch("")}>
                         <X size={16} />
@@ -355,37 +534,71 @@ function App() {
                 </header>
 
                 <div className="list-scroll">
-                  {loading && <p>Loading chats...</p>}
+                  {chatsLoading && chats.length === 0 && (
+                    <p>Loading chats...</p>
+                  )}
+
                   {error && <p role="alert">{error}</p>}
 
                   {filteredChats.map(chat => {
-                    const name = chat.name || chat.display_name || "BELVIA user";
+                    const name =
+                      chat.name ||
+                      chat.display_name ||
+                      chat.phone_number ||
+                      "BELVIA user";
+
                     const last = chat.last_message;
+                    const unread = Number(chat.unread_count || 0);
 
                     return (
                       <button
                         key={chat.id}
                         className="chat-row"
-                        onClick={() => setActiveId(chat.id)}
+                        onClick={() => openChat(chat)}
                       >
-                        <Avatar name={name} online={chat.online} />
+                        <Avatar
+                          name={name}
+                          online={chat.online}
+                        />
+
                         <div className="chat-row-body">
                           <div className="chat-row-top">
                             <strong>{name}</strong>
-                            <small>{last?.created_at ? new Date(last.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</small>
+
+                            <small>
+                              {formatTime(last?.created_at)}
+                            </small>
                           </div>
-                          <p>{last?.content || last?.text || "Start a conversation"}</p>
+
+                          <p>
+                            {last?.content ||
+                              last?.text ||
+                              "Start a conversation"}
+                          </p>
                         </div>
+
+                        {unread > 0 && (
+                          <span className="unread-count">
+                            {unread > 99 ? "99+" : unread}
+                          </span>
+                        )}
                       </button>
                     );
                   })}
 
-                  {!loading && !error && filteredChats.length === 0 && (
-                    <p>No conversations found.</p>
-                  )}
+                  {!chatsLoading &&
+                    !error &&
+                    filteredChats.length === 0 && (
+                      <p>
+                        {search
+                          ? "No matching conversations."
+                          : "No conversations yet. Start a new chat."}
+                      </p>
+                    )}
 
                   <div className="e2e-note">
-                    <Lock size={12} /> Your messages are private
+                    <Lock size={12} />
+                    Your messages are private
                   </div>
                 </div>
 
@@ -407,9 +620,6 @@ function App() {
                   <h1>Status</h1>
                 </header>
                 <p>No status updates available.</p>
-                <button className="fab" onClick={() => setNotice("Status publishing requires the status API.")}>
-                  <Plus size={24} />
-                </button>
               </div>
             )}
 
@@ -447,21 +657,42 @@ function App() {
       )}
 
       {newChatOpen && (
-        <div className="modal-overlay">
+        <div
+          className="modal-overlay"
+          onClick={event => {
+            if (event.target === event.currentTarget) {
+              setNewChatOpen(false);
+            }
+          }}
+        >
           <div className="modal">
             <div className="brand-row">
               <h2>New conversation</h2>
-              <button className="icon-btn" onClick={() => setNewChatOpen(false)}>
+
+              <button
+                className="icon-btn"
+                onClick={() => setNewChatOpen(false)}
+              >
                 <X size={20} />
               </button>
             </div>
+
             <input
               value={phone}
-              onChange={e => setPhone(e.target.value)}
+              onChange={event => setPhone(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Enter") createChat();
+              }}
               placeholder="Phone number e.g. +2547XXXXXXXX"
             />
-            <button className="send-btn" onClick={createChat} disabled={loading}>
-              <UserPlus size={18} /> Start chat
+
+            <button
+              className="send-btn"
+              onClick={createChat}
+              disabled={!phone.trim()}
+            >
+              <UserPlus size={18} />
+              Start chat
             </button>
           </div>
         </div>
@@ -470,10 +701,13 @@ function App() {
       {(error || notice) && (
         <div className="notice" role="status">
           <span>{notice || error}</span>
-          <button onClick={() => {
-            setNotice("");
-            setError("");
-          }}>
+
+          <button
+            onClick={() => {
+              setNotice("");
+              setError("");
+            }}
+          >
             <X size={16} />
           </button>
         </div>
